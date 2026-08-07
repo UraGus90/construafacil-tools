@@ -32,8 +32,12 @@ Adiciona ao painel do Construa Fácil estes recursos:
   caixinha no cabeçalho para **marcar/desmarcar todos**.
 - Os arquivos são buscados e **compactados num único `.zip`** (nomeado pelo nº da
   solicitação), em vez de cair um a um na pasta Downloads. Mais produtivo.
-- Se algum anexo falhar, os demais são compactados mesmo assim e a extensão
-  avisa quais não entraram.
+- Os anexos são baixados **vários ao mesmo tempo** (4 por padrão), o que deixa o
+  ZIP bem mais rápido em solicitações com muitos arquivos. Para ajustar, use
+  **Downloads simultâneos** no painel: mais alto = mais rápido; se algum anexo
+  falhar sempre, reduza para **1**.
+- Se algum anexo falhar, a extensão **tenta de novo um a um**; os que vierem são
+  compactados normalmente e ela avisa quais não entraram.
 - **Reserva:** no painel há **"Baixar um a um (sem ZIP)"**, que clica os botões
   da página com um intervalo ajustável — use se o ZIP não funcionar.
 

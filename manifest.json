@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Construa Fácil — Ferramentas",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Filtros, relatório de produtividade, gravação automática em arquivo e download de anexos em um único ZIP no painel do Construa Fácil.",
   "permissions": ["storage", "activeTab", "scripting"],
   "host_permissions": [

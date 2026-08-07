@@ -16,7 +16,8 @@
 
   // Gravação automática em arquivo (File System Access API) e fila de downloads.
   let regFileHandle = null;          // handle do arquivo .csv escolhido pelo usuário
-  let DL_GAP_MS = 1500;              // intervalo entre downloads na fila
+  let DL_GAP_MS = 1500;              // intervalo entre downloads no modo "um a um"
+  let DL_CONCURRENCY = 4;            // anexos buscados ao mesmo tempo no modo ZIP
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const CSV_HEADER = "Data do registro;Nº Solicitação;Órgão;Tipo;Resultado;Analista\n";
 
@@ -551,6 +552,10 @@
         <p class="hint">Junta todos os anexos em <b>um único arquivo .zip</b>. Você também pode
         marcar as caixinhas nas linhas da tabela e usar <b>Baixar selecionados</b>, ou os botões
         que aparecem na barra verde acima da tabela de anexos.</p>
+        <label style="margin-top:10px">Downloads simultâneos (velocidade)</label>
+        <input type="number" id="cf-dlConc" min="1" max="8" step="1" value="4">
+        <p class="hint">Quantos anexos são buscados ao mesmo tempo ao gerar o ZIP.
+        Mais alto = mais rápido. Se algum anexo falhar sempre, baixe para <b>1</b>.</p>
         <button class="btn ghost" id="cf-dlAllSeq">Baixar um a um (sem ZIP)</button>
         <label style="margin-top:10px">Intervalo do modo "um a um" (segundos)</label>
         <input type="number" id="cf-dlGap" min="0.3" max="10" step="0.1" value="1.5">
@@ -710,10 +715,11 @@
     refreshProdInfo("Todos os registros foram apagados.");
   }
 
-  /* ===================== downloads de anexos (em fila) ===================== */
+  /* ===================== downloads de anexos ===================== */
   // Tabelas de anexos têm colunas "Nome do arquivo" e "Ações". Em cada linha há
-  // um botão/link de download (PrimeFaces, via POST). Não dá para baixar tudo de
-  // uma vez sem travar o sistema antigo, então clicamos um a um, com intervalo.
+  // um botão/link de download (PrimeFaces, via POST). O modo principal refaz esses
+  // POSTs em paralelo (DL_CONCURRENCY) e junta tudo num ZIP; o modo reserva clica os
+  // botões um a um, com intervalo (DL_GAP_MS), para não afogar o sistema antigo.
 
   const acoesColIndex = (table) => getHeaders(table).findIndex((h) => /a[cç][õo]es/i.test(h));
   const fileColIndex = (table) => getHeaders(table).findIndex((h) => /arquivo/i.test(h));
@@ -899,13 +905,15 @@
   /* ---- gerador de ZIP sem dependências (método "store", sem compressão) ---- */
   const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
   function crc32(u8) { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+  // Devolve as PARTES do zip (Uint8Array[]) para montar o Blob direto, sem copiar
+  // tudo para um buffer único antes. Aceita f.crc já calculado (ver startDownloads).
   function makeZip(files) {
     const enc = new TextEncoder();
     const parts = []; const central = []; let offset = 0;
     const u16 = (a, x) => a.push(x & 255, (x >>> 8) & 255);
     const u32 = (a, x) => a.push(x & 255, (x >>> 8) & 255, (x >>> 16) & 255, (x >>> 24) & 255);
     for (const f of files) {
-      const name = enc.encode(f.name); const data = f.data; const crc = crc32(data); const n = data.length; const at = offset;
+      const name = enc.encode(f.name); const data = f.data; const crc = f.crc != null ? f.crc : crc32(data); const n = data.length; const at = offset;
       const lh = []; u32(lh, 0x04034b50); u16(lh, 20); u16(lh, 0x0800); u16(lh, 0); u16(lh, 0); u16(lh, 0); u32(lh, crc); u32(lh, n); u32(lh, n); u16(lh, name.length); u16(lh, 0);
       const lhu = new Uint8Array(lh); parts.push(lhu, name, data); offset += lhu.length + name.length + n;
       const ch = []; u32(ch, 0x02014b50); u16(ch, 20); u16(ch, 20); u16(ch, 0x0800); u16(ch, 0); u16(ch, 0); u16(ch, 0); u32(ch, crc); u32(ch, n); u32(ch, n); u16(ch, name.length); u16(ch, 0); u16(ch, 0); u16(ch, 0); u16(ch, 0); u32(ch, 0); u32(ch, at);
@@ -915,13 +923,16 @@
     central.forEach((u) => { parts.push(u); cdSize += u.length; offset += u.length; });
     const eo = []; u32(eo, 0x06054b50); u16(eo, 0); u16(eo, 0); u16(eo, files.length); u16(eo, files.length); u32(eo, cdSize); u32(eo, cdStart); u16(eo, 0);
     parts.push(new Uint8Array(eo));
-    const total = parts.reduce((a, u) => a + u.length, 0); const out = new Uint8Array(total); let p = 0;
-    for (const u of parts) { out.set(u, p); p += u.length; }
-    return out;
+    return parts;
   }
 
   let downloading = false;
   // Modo principal: junta tudo em UM zip.
+  // Os anexos são buscados em PARALELO (DL_CONCURRENCY por vez) e o CRC de cada um já
+  // é calculado na chegada — assim o tempo de CPU do zip corre junto com a espera da
+  // rede e a etapa "Compactando" fica quase instantânea. Quem falhar em paralelo
+  // ganha uma segunda tentativa um a um (o sistema é antigo e pode recusar
+  // requisições simultâneas).
   async function startDownloads(els, table) {
     if (downloading) { alert("Já há um download em andamento. Aguarde terminar."); return; }
     const setStatus = (t) => (table ? updateDlBar(table, t) : refreshAnexoInfo(t));
@@ -929,28 +940,50 @@
     if (!els.length) { setStatus("Nenhum anexo marcado/disponível."); clearStatus(2500); return; }
     if (!confirm(`Baixar ${els.length} anexo(s) em um único arquivo ZIP?`)) return;
     downloading = true;
+    const t0 = Date.now();
     try {
-      const files = []; const failed = [];
-      for (let i = 0; i < els.length; i++) {
-        setStatus(`Baixando ${i + 1}/${els.length}…`);
-        try {
-          const { blob, name } = await fetchAnexoBlob(els[i], i);
-          const data = new Uint8Array(await blob.arrayBuffer());
-          files.push({ name: uniqueName(name, files), data });
-        } catch (e) { failed.push(rowFileName(els[i]) || `anexo ${i + 1}`); }
-        await sleep(120);
+      const got = new Array(els.length).fill(null);
+      let next = 0, done = 0;
+      const show = () => setStatus(`Baixando ${done}/${els.length}…`);
+      const grab = async (i) => {
+        const { blob, name } = await fetchAnexoBlob(els[i], i);
+        const data = new Uint8Array(await blob.arrayBuffer());
+        got[i] = { name, data, crc: crc32(data) };
+      };
+      show();
+      const lanes = Math.max(1, Math.min(DL_CONCURRENCY, els.length));
+      await Promise.all(Array.from({ length: lanes }, async () => {
+        for (let i = next++; i < els.length; i = next++) {
+          try { await grab(i); } catch (e) {}
+          done++; show();
+        }
+      }));
+
+      // segunda tentativa, sequencial, só para os que não vieram
+      const missing = got.map((g, i) => (g ? -1 : i)).filter((i) => i >= 0);
+      if (missing.length && lanes > 1) {
+        for (let k = 0; k < missing.length; k++) {
+          setStatus(`Tentando de novo ${k + 1}/${missing.length}…`);
+          try { await grab(missing[k]); } catch (e) {}
+          await sleep(120);
+        }
       }
+
+      const files = []; const failed = [];
+      got.forEach((g, i) => {
+        if (g) files.push({ name: uniqueName(g.name, files), data: g.data, crc: g.crc });
+        else failed.push(rowFileName(els[i]) || `anexo ${i + 1}`);
+      });
       if (!files.length) {
         setStatus("Não consegui obter os anexos. Nenhum ZIP gerado.");
         alert("Não foi possível baixar os anexos para o ZIP.\n\nProvável causa: o botão de download da tabela é diferente do esperado. Me envie o HTML de uma linha de anexo para eu ajustar.\n\nEnquanto isso, tente \"Baixar um a um (sem ZIP)\".");
         clearStatus(100); return;
       }
       setStatus("Compactando…");
-      const zip = makeZip(files);
       const proc = (getProcesso() || "solicitacao").replace(/[^\w.-]+/g, "_");
-      downloadBlob(new Blob([zip], { type: "application/zip" }), `anexos-${proc}-${new Date().toISOString().slice(0, 10)}.zip`);
-      let msg = `ZIP gerado com ${files.length} arquivo(s).`;
-      if (failed.length) { msg += ` ${failed.length} falhou(aram).`; alert(`${failed.length} anexo(s) não entraram no ZIP:\n- ${failed.join("\n- ")}\n\nOs outros ${files.length} foram compactados normalmente.`); }
+      downloadBlob(new Blob(makeZip(files), { type: "application/zip" }), `anexos-${proc}-${new Date().toISOString().slice(0, 10)}.zip`);
+      let msg = `ZIP gerado com ${files.length} arquivo(s) em ${((Date.now() - t0) / 1000).toFixed(1)}s.`;
+      if (failed.length) { msg += ` ${failed.length} falhou(aram).`; alert(`${failed.length} anexo(s) não entraram no ZIP:\n- ${failed.join("\n- ")}\n\nOs outros ${files.length} foram compactados normalmente.\n\nSe falhar sempre, reduza "Downloads simultâneos" para 1 no painel ⚙.`); }
       setStatus(msg); clearStatus(6000);
     } finally { downloading = false; }
   }
@@ -1002,6 +1035,7 @@
   $("#cf-dlAll").addEventListener("click", () => startDownloads(collectEls(getAnexoTables(), "all"), null));
   $("#cf-dlAllSeq").addEventListener("click", () => clickDownloadsOneByOne(collectEls(getAnexoTables(), "all"), null));
   $("#cf-dlGap").addEventListener("change", (e) => { const v = parseFloat(e.target.value); if (v >= 0.3 && v <= 10) DL_GAP_MS = Math.round(v * 1000); else e.target.value = (DL_GAP_MS / 1000).toFixed(1); });
+  $("#cf-dlConc").addEventListener("change", (e) => { const v = parseInt(e.target.value, 10); if (v >= 1 && v <= 8) DL_CONCURRENCY = v; else e.target.value = DL_CONCURRENCY; });
   $("#cf-clearAll").addEventListener("click", clearAllFilters);
   $("#cf-reattach").addEventListener("click", () => { getTables().forEach(attachFilters); initAnexos(); });
 
